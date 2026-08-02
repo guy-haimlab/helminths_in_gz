@@ -1,6 +1,5 @@
 # ================================================================
 # Helminths associated with gelatinous zooplankton
-# Reproducible R analysis script for publication supporting material
 # ================================================================
 #
 # This script produces:
@@ -37,7 +36,7 @@ files <- list(
   occurrence_donut = "donut.xlsx",
   latlon           = "parlatlon2.xlsx",
   accumulation     = "species accumulation.xlsx",
-  host_size        = "host_size_parasitic_load.xlsx"
+  host_size        = "host size parasitic load.xlsx"
 )
 
 # Excel sheets
@@ -51,6 +50,13 @@ sheets <- list(
 # Plot settings
 bin_size <- 5
 dpi_tiff <- 300
+
+# Permutational sensitivity analysis settings
+# Set run_sensitivity_analysis <- FALSE to skip the longer permutation analyses.
+run_sensitivity_analysis <- TRUE
+sensitivity_permutations <- 9999
+sensitivity_bin_widths <- c(5, 10, 15)
+latitude_jitter_deg <- 2.5
 
 # Fixed colour palette for parasite groups
 parasite_group_cols <- c(
@@ -411,6 +417,387 @@ analyse_latitudinal_richness <- function() {
   utils::write.csv(lat_richness, path_out("latitudinal_species_richness_5deg.csv"), row.names = FALSE)
 
   invisible(list(data = lat_richness, plot = p))
+}
+
+
+# -----------------------------
+# 6b. PERMUTATIONAL SENSITIVITY ANALYSIS FOR LATITUDINAL PATTERNS
+# -----------------------------
+# Purpose:
+#   Tests whether the inferred temperate / inverse-LDG pattern is robust to:
+#     1. alternative latitudinal bin widths,
+#     2. random shifts in bin boundaries,
+#     3. small uncertainty in locality latitude,
+#     4. record-level resampling.
+#
+# Outputs:
+#   - sensitivity_latitudinal_pattern_replicates.csv
+#   - sensitivity_latitudinal_pattern_summary.csv
+#   - figure_sensitivity_temperate_tropical_richness_ratio.tiff
+
+zone_from_abs_lat <- function(abs_lat, tropical_limit = 23.5, temperate_limit = 60) {
+  dplyr::case_when(
+    abs_lat < tropical_limit ~ "tropical",
+    abs_lat >= tropical_limit & abs_lat <= temperate_limit ~ "temperate",
+    TRUE ~ "high_latitude"
+  )
+}
+
+lat_to_bin_mid <- function(lat, bin_width = 5, origin = 0) {
+  # The origin randomly shifts bin boundaries so the result is not tied to
+  # a single arbitrary bin start.
+  floor((lat + 90 - origin) / bin_width) * bin_width +
+    bin_width / 2 - 90 + origin
+}
+
+get_zone_value <- function(df, zone, column) {
+  value <- df[df$broad_zone == zone, column, drop = TRUE]
+  if (length(value) == 0) return(0)
+  value
+}
+
+compute_latitudinal_metrics <- function(dat,
+                                        bin_width = 5,
+                                        origin = 0,
+                                        tropical_limit = 23.5,
+                                        temperate_limit = 60) {
+
+  dat_binned <- dat |>
+    dplyr::mutate(
+      lat_mid = lat_to_bin_mid(lat_perm, bin_width = bin_width, origin = origin),
+      abs_lat = abs(lat_perm),
+      broad_zone = zone_from_abs_lat(
+        abs_lat,
+        tropical_limit = tropical_limit,
+        temperate_limit = temperate_limit
+      )
+    )
+
+  occ_bins <- dat_binned |>
+    dplyr::group_by(lat_mid) |>
+    dplyr::summarise(
+      n_occurrences = dplyr::n(),
+      .groups = "drop"
+    )
+
+  rich_bins <- dat_binned |>
+    dplyr::group_by(lat_mid) |>
+    dplyr::summarise(
+      species_richness = dplyr::n_distinct(species),
+      .groups = "drop"
+    )
+
+  peak_occ_lat <- occ_bins$lat_mid[which.max(occ_bins$n_occurrences)]
+  peak_rich_lat <- rich_bins$lat_mid[which.max(rich_bins$species_richness)]
+
+  occ_zone <- dat_binned |>
+    dplyr::group_by(broad_zone) |>
+    dplyr::summarise(
+      n_occurrences = dplyr::n(),
+      .groups = "drop"
+    )
+
+  # Species occurring in more than one broad latitudinal zone are counted once
+  # in each zone, because each zone contains a separate occurrence of that species.
+  rich_zone <- dat_binned |>
+    dplyr::distinct(broad_zone, species) |>
+    dplyr::group_by(broad_zone) |>
+    dplyr::summarise(
+      species_richness = dplyr::n_distinct(species),
+      .groups = "drop"
+    )
+
+  occ_tropical   <- get_zone_value(occ_zone, "tropical", "n_occurrences")
+  occ_temperate  <- get_zone_value(occ_zone, "temperate", "n_occurrences")
+  rich_tropical  <- get_zone_value(rich_zone, "tropical", "species_richness")
+  rich_temperate <- get_zone_value(rich_zone, "temperate", "species_richness")
+
+  data.frame(
+    bin_width = bin_width,
+    origin = origin,
+
+    occ_peak_lat = peak_occ_lat,
+    occ_peak_abs_lat = abs(peak_occ_lat),
+    occ_peak_zone = zone_from_abs_lat(abs(peak_occ_lat), tropical_limit, temperate_limit),
+
+    rich_peak_lat = peak_rich_lat,
+    rich_peak_abs_lat = abs(peak_rich_lat),
+    rich_peak_zone = zone_from_abs_lat(abs(peak_rich_lat), tropical_limit, temperate_limit),
+
+    occ_tropical = occ_tropical,
+    occ_temperate = occ_temperate,
+    rich_tropical = rich_tropical,
+    rich_temperate = rich_temperate,
+
+    # Add 0.5 to avoid division by zero in rare bootstrap replicates.
+    occ_temperate_tropical_ratio = (occ_temperate + 0.5) / (occ_tropical + 0.5),
+    rich_temperate_tropical_ratio = (rich_temperate + 0.5) / (rich_tropical + 0.5)
+  )
+}
+
+analyse_latitudinal_sensitivity <- function(n_perm = sensitivity_permutations,
+                                            bin_widths = sensitivity_bin_widths,
+                                            jitter_deg = latitude_jitter_deg,
+                                            tropical_limit = 23.5,
+                                            temperate_limit = 60,
+                                            seed = 123) {
+
+  set.seed(seed)
+
+  df <- prepare_latlon_data()
+  if (is.null(df)) return(invisible(NULL))
+
+  if (!("species" %in% names(df))) {
+    warning("Skipping latitudinal sensitivity analysis: column 'species' was not found in ", files$latlon)
+    return(invisible(NULL))
+  }
+
+  df <- df |>
+    dplyr::mutate(
+      species = stringr::str_squish(as.character(species))
+    ) |>
+    dplyr::filter(
+      !is.na(species), species != "",
+      !is.na(lat), lat >= -90, lat <= 90
+    )
+
+  if (nrow(df) == 0) {
+    warning("Skipping latitudinal sensitivity analysis: no valid records after filtering.")
+    return(invisible(NULL))
+  }
+
+  sensitivity_results <- purrr::map_dfr(seq_len(n_perm), function(i) {
+
+    bw <- sample(bin_widths, size = 1)
+    origin <- stats::runif(1, min = 0, max = bw)
+
+    # Record-level bootstrap tests whether the pattern is driven by a few records.
+    boot_index <- sample(seq_len(nrow(df)), size = nrow(df), replace = TRUE)
+
+    dat_perm <- df[boot_index, , drop = FALSE] |>
+      dplyr::mutate(
+        # Latitude jitter tests sensitivity to small locality uncertainty.
+        lat_perm = lat + stats::runif(dplyr::n(), -jitter_deg, jitter_deg),
+        lat_perm = pmax(pmin(lat_perm, 90), -90)
+      )
+
+    compute_latitudinal_metrics(
+      dat_perm,
+      bin_width = bw,
+      origin = origin,
+      tropical_limit = tropical_limit,
+      temperate_limit = temperate_limit
+    ) |>
+      dplyr::mutate(iteration = i)
+  })
+
+  sensitivity_summary <- sensitivity_results |>
+    dplyr::summarise(
+      n_permutations = dplyr::n(),
+
+      prop_occ_peak_temperate =
+        mean(occ_peak_zone == "temperate", na.rm = TRUE),
+
+      prop_rich_peak_temperate =
+        mean(rich_peak_zone == "temperate", na.rm = TRUE),
+
+      prop_occ_temperate_exceeds_tropical =
+        mean(occ_temperate > occ_tropical, na.rm = TRUE),
+
+      prop_rich_temperate_exceeds_tropical =
+        mean(rich_temperate > rich_tropical, na.rm = TRUE),
+
+      median_occ_temperate_tropical_ratio =
+        median(occ_temperate_tropical_ratio, na.rm = TRUE),
+
+      occ_ratio_lower_95 =
+        stats::quantile(occ_temperate_tropical_ratio, 0.025, na.rm = TRUE),
+
+      occ_ratio_upper_95 =
+        stats::quantile(occ_temperate_tropical_ratio, 0.975, na.rm = TRUE),
+
+      median_rich_temperate_tropical_ratio =
+        median(rich_temperate_tropical_ratio, na.rm = TRUE),
+
+      rich_ratio_lower_95 =
+        stats::quantile(rich_temperate_tropical_ratio, 0.025, na.rm = TRUE),
+
+      rich_ratio_upper_95 =
+        stats::quantile(rich_temperate_tropical_ratio, 0.975, na.rm = TRUE)
+    )
+
+  utils::write.csv(
+    sensitivity_results,
+    path_out("sensitivity_latitudinal_pattern_replicates.csv"),
+    row.names = FALSE
+  )
+
+  utils::write.csv(
+    sensitivity_summary,
+    path_out("sensitivity_latitudinal_pattern_summary.csv"),
+    row.names = FALSE
+  )
+
+  p_ratio <- ggplot2::ggplot(
+    sensitivity_results,
+    ggplot2::aes(x = rich_temperate_tropical_ratio)
+  ) +
+    ggplot2::geom_histogram(bins = 60, fill = "grey75", colour = "black", linewidth = 0.2) +
+    ggplot2::geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.8) +
+    ggplot2::labs(
+      x = "Temperate:tropical ratio of helminth species richness",
+      y = "Number of permutations"
+    ) +
+    ggplot2::theme_classic(base_size = 12)
+
+  save_tiff(
+    p_ratio,
+    "figure_sensitivity_temperate_tropical_richness_ratio.tiff",
+    width = 130,
+    height = 80
+  )
+
+  invisible(list(
+    replicates = sensitivity_results,
+    summary = sensitivity_summary,
+    plot = p_ratio
+  ))
+}
+
+
+# -----------------------------
+# 6c. NULL MODEL FOR LATITUDINAL SPECIES RICHNESS
+# -----------------------------
+# Purpose:
+#   Tests whether the observed species-richness pattern can be explained by
+#   unequal numbers of occurrence records among latitude bins. The number of
+#   records in each latitude bin is held constant, while species identities are
+#   permuted among records.
+#
+# Outputs:
+#   - sensitivity_species_richness_null_by_bin.csv
+#   - figure_latitudinal_richness_null_model.tiff
+
+analyse_latitudinal_richness_null <- function(n_perm = sensitivity_permutations,
+                                              bin_width = bin_size,
+                                              seed = 123) {
+
+  set.seed(seed)
+
+  df <- prepare_latlon_data()
+  if (is.null(df)) return(invisible(NULL))
+
+  if (!("species" %in% names(df))) {
+    warning("Skipping latitudinal richness null model: column 'species' was not found in ", files$latlon)
+    return(invisible(NULL))
+  }
+
+  df <- df |>
+    dplyr::mutate(
+      species = stringr::str_squish(as.character(species)),
+      lat_mid = floor(lat / bin_width) * bin_width + bin_width / 2
+    ) |>
+    dplyr::filter(
+      !is.na(species), species != "",
+      !is.na(lat_mid)
+    )
+
+  if (nrow(df) == 0) {
+    warning("Skipping latitudinal richness null model: no valid records after filtering.")
+    return(invisible(NULL))
+  }
+
+  observed <- df |>
+    dplyr::group_by(lat_mid) |>
+    dplyr::summarise(
+      n_occurrences = dplyr::n(),
+      observed_richness = dplyr::n_distinct(species),
+      .groups = "drop"
+    )
+
+  null_results <- purrr::map_dfr(seq_len(n_perm), function(i) {
+
+    df_perm <- df |>
+      dplyr::mutate(
+        species_perm = sample(species, size = dplyr::n(), replace = FALSE)
+      )
+
+    df_perm |>
+      dplyr::group_by(lat_mid) |>
+      dplyr::summarise(
+        permuted_richness = dplyr::n_distinct(species_perm),
+        .groups = "drop"
+      ) |>
+      dplyr::mutate(iteration = i)
+  })
+
+  null_summary <- null_results |>
+    dplyr::group_by(lat_mid) |>
+    dplyr::summarise(
+      null_mean = mean(permuted_richness, na.rm = TRUE),
+      null_sd = stats::sd(permuted_richness, na.rm = TRUE),
+      null_lower_95 = stats::quantile(permuted_richness, 0.025, na.rm = TRUE),
+      null_upper_95 = stats::quantile(permuted_richness, 0.975, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  result <- observed |>
+    dplyr::left_join(null_summary, by = "lat_mid") |>
+    dplyr::mutate(
+      richness_ses = dplyr::if_else(
+        is.na(null_sd) | null_sd == 0,
+        NA_real_,
+        (observed_richness - null_mean) / null_sd
+      )
+    )
+
+  utils::write.csv(
+    result,
+    path_out("sensitivity_species_richness_null_by_bin.csv"),
+    row.names = FALSE
+  )
+
+  p_null <- ggplot2::ggplot(result, ggplot2::aes(x = lat_mid, y = observed_richness)) +
+    ggplot2::geom_ribbon(
+      ggplot2::aes(ymin = null_lower_95, ymax = null_upper_95),
+      fill = "grey80",
+      alpha = 0.7
+    ) +
+    ggplot2::geom_line(
+      ggplot2::aes(y = null_mean),
+      linewidth = 0.8,
+      linetype = "dashed"
+    ) +
+    ggplot2::geom_col(
+      width = bin_width * 0.9,
+      fill = "grey40",
+      colour = "black",
+      linewidth = 0.2
+    ) +
+    ggplot2::scale_x_continuous(
+      limits = c(-90, 90),
+      breaks = seq(-90, 90, by = 30),
+      labels = latitude_labels
+    ) +
+    ggplot2::labs(
+      x = "Latitude",
+      y = "Helminth species richness",
+      caption = "Grey envelope: 95% null interval after permuting species identities among records"
+    ) +
+    ggplot2::theme_classic(base_size = 12)
+
+  save_tiff(
+    p_null,
+    "figure_latitudinal_richness_null_model.tiff",
+    width = 130,
+    height = 80
+  )
+
+  invisible(list(
+    observed_vs_null = result,
+    null_replicates = null_results,
+    plot = p_null
+  ))
 }
 
 
@@ -842,6 +1229,25 @@ run_all_analyses <- function() {
     occurrence_donut       = plot_occurrence_donut(),
     latitudinal_occurrence = analyse_latitudinal_occurrence(),
     latitudinal_richness   = analyse_latitudinal_richness(),
+    latitudinal_sensitivity = if (run_sensitivity_analysis) {
+      analyse_latitudinal_sensitivity(
+        n_perm = sensitivity_permutations,
+        bin_widths = sensitivity_bin_widths,
+        jitter_deg = latitude_jitter_deg,
+        seed = 123
+      )
+    } else {
+      NULL
+    },
+    latitudinal_richness_null = if (run_sensitivity_analysis) {
+      analyse_latitudinal_richness_null(
+        n_perm = sensitivity_permutations,
+        bin_width = bin_size,
+        seed = 123
+      )
+    } else {
+      NULL
+    },
     diversity_donut        = plot_parasite_group_diversity_donut(),
     species_accumulation   = analyse_species_accumulation(),
     host_size              = analyse_host_size_parasitic_load()
@@ -853,3 +1259,4 @@ run_all_analyses <- function() {
 }
 
 results <- run_all_analyses()
+
